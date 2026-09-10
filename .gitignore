@@ -1,0 +1,32 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# CDK
+cdk.out/
+cdk.context.json
+*.js
+!jest.config.js
+*.d.ts
+
+# 環境固有・機密
+.env
+.env.*
+env.sh
+*.pem
+*.key
+
+# 作業ファイル
+response.json
+*.log
+out.json
+
+# エディタ・OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
