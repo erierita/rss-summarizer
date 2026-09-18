@@ -18,6 +18,9 @@ from aws_cdk import (
     aws_logs as logs,
     aws_secretsmanager as sm,
     aws_cognito as cognito,
+    aws_apigatewayv2 as apigwv2,
+    aws_apigatewayv2_authorizers as apigwv2_authorizers,
+    aws_apigatewayv2_integrations as apigwv2_integrations,
 )
 from constructs import Construct
 
@@ -254,6 +257,63 @@ class RssSummarizerStack(Stack):
         )
 
         # ==================================================================
+        # 段階2: 保護されたAPI（呼ばれる側）
+        # ==================================================================
+
+        # 登録された記事の保存先。既存の ArticleTable とは別テーブル
+        registry_table = dynamodb.Table(
+            self,
+            "ArticleRegistryTable",
+            partition_key=dynamodb.Attribute(
+                name="url_hash", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+            time_to_live_attribute="ttl",
+        )
+
+        # APIの実処理を行うLambda
+        receiver_fn = make_lambda(
+            "ArticleReceiverFunction",
+            "article_receiver",
+            timeout_sec=30,
+            env={"TABLE_NAME": registry_table.table_name},
+        )
+        registry_table.grant_read_write_data(receiver_fn)
+
+        # JWT Authorizer: トークンの署名・exp・iss・aud を自動で検証する
+        # Cognitoの公開鍵(JWKS)はAPI Gatewayが自動取得する
+        jwt_authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
+            "ArticleApiJwtAuthorizer",
+            jwt_issuer=(
+                f"https://cognito-idp.{self.region}.amazonaws.com/"
+                f"{user_pool.user_pool_id}"
+            ),
+            jwt_audience=[api_client.user_pool_client_id],
+            identity_source=["$request.header.Authorization"],
+        )
+
+        # HTTP API: REST APIより軽量・低コストなAPI Gateway
+        article_api = apigwv2.HttpApi(
+            self,
+            "ArticleHttpApi",
+            api_name="rss-summarizer-article-api",
+            description="OAuth2で保護された記事登録API",
+        )
+
+        # ルート定義: POST /articles
+        # authorization_scopes でスコープを要求する
+        article_api.add_routes(
+            path="/articles",
+            methods=[apigwv2.HttpMethod.POST],
+            authorizer=jwt_authorizer,
+            authorization_scopes=["rss-summarizer/articles.write"],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "ArticleReceiverIntegration", receiver_fn
+            ),
+        )
+
+        # ==================================================================
         # Phase 3: Step Functions（記事1件ごとの処理フロー）
         # ==================================================================
 
@@ -405,7 +465,7 @@ class RssSummarizerStack(Stack):
         CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
         CfnOutput(self, "FetchFeedFunctionName", value=fetch_feed_fn.function_name)
         CfnOutput(self, "SlackSecretName", value=slack_secret.secret_name)
-        
+
                 # --- 段階1で追加 ---
         CfnOutput(self, "CognitoUserPoolId", value=user_pool.user_pool_id)
         CfnOutput(self, "CognitoClientId", value=api_client.user_pool_client_id)
@@ -415,3 +475,5 @@ class RssSummarizerStack(Stack):
             value=f"{user_pool_domain.base_url()}/oauth2/token",
         )
         CfnOutput(self, "ApiCredentialsSecretName", value=api_credentials.secret_name)
+        CfnOutput(self, "ArticleApiEndpoint", value=article_api.api_endpoint)
+        CfnOutput(self, "ArticleRegistryTableName", value=registry_table.table_name)
