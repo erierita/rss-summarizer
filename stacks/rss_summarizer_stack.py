@@ -17,6 +17,7 @@ from aws_cdk import (
     aws_iam as iam,
     aws_logs as logs,
     aws_secretsmanager as sm,
+    aws_cognito as cognito,
 )
 from constructs import Construct
 
@@ -186,6 +187,72 @@ class RssSummarizerStack(Stack):
         # Lambdaにシークレット読み取り権限を付与（このシークレットのみ）
         slack_secret.grant_read(notify_fn)
 
+        
+        # ==================================================================
+        # 段階1: 認可サーバー（Cognito）
+        # ==================================================================
+        # OAuth2 Client Credentials でサービス間認証を行うための認可サーバー。
+        # ユーザーは作らず、アプリ（クライアント）自身の資格情報でトークンを発行する。
+
+        # User Pool: Resource Server と App Client を収める入れ物
+        user_pool = cognito.UserPool(
+            self,
+            "ApiUserPool",
+            user_pool_name="rss-summarizer-api",
+            self_sign_up_enabled=False,  # ユーザー登録機能は使わない
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # Resource Server: 保護対象のAPIとスコープを定義する
+        # identifier がスコープ名の接頭辞になる → "rss-summarizer/articles.write"
+        read_scope = cognito.ResourceServerScope(
+            scope_name="articles.read", scope_description="記事の参照"
+        )
+        write_scope = cognito.ResourceServerScope(
+            scope_name="articles.write", scope_description="記事の登録"
+        )
+        resource_server = user_pool.add_resource_server(
+            "ArticleApiResourceServer",
+            identifier="rss-summarizer",
+            scopes=[read_scope, write_scope],
+        )
+
+        # Domain: トークンエンドポイントのURLを決める
+        # 全AWSアカウントで一意である必要があるためアカウントIDを含める
+        user_pool_domain = user_pool.add_domain(
+            "ApiUserPoolDomain",
+            cognito_domain=cognito.CognitoDomainOptions(
+                domain_prefix=f"rss-summarizer-{self.account}"
+            ),
+        )
+
+        # App Client: client_id / client_secret の発行元
+        # write スコープのみ割り当てる（read は将来の閲覧用クライアント向けに定義だけ）
+        api_client = user_pool.add_client(
+            "BatchApiClient",
+            user_pool_client_name="rss-summarizer-batch",
+            generate_secret=True,  # client_secret を発行する
+            o_auth=cognito.OAuthSettings(
+                flows=cognito.OAuthFlows(client_credentials=True),
+                scopes=[
+                    cognito.OAuthScope.resource_server(resource_server, write_scope),
+                ],
+            ),
+            access_token_validity=Duration.hours(1),
+        )
+        # Resource Server が先に作られる必要がある
+        api_client.node.add_dependency(resource_server)
+
+        # Secrets Manager: 資格情報の保管場所（箱だけ作る）
+        # 値はデプロイ後にCLIで登録する。Slack Webhook と同じ方針
+        api_credentials = sm.Secret(
+            self,
+            "ApiClientCredentials",
+            secret_name="rss-summarizer/api-client",
+            description="OAuth2 client credentials for the article registry API",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
         # ==================================================================
         # Phase 3: Step Functions（記事1件ごとの処理フロー）
         # ==================================================================
@@ -338,3 +405,13 @@ class RssSummarizerStack(Stack):
         CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
         CfnOutput(self, "FetchFeedFunctionName", value=fetch_feed_fn.function_name)
         CfnOutput(self, "SlackSecretName", value=slack_secret.secret_name)
+        
+                # --- 段階1で追加 ---
+        CfnOutput(self, "CognitoUserPoolId", value=user_pool.user_pool_id)
+        CfnOutput(self, "CognitoClientId", value=api_client.user_pool_client_id)
+        CfnOutput(
+            self,
+            "CognitoTokenUrl",
+            value=f"{user_pool_domain.base_url()}/oauth2/token",
+        )
+        CfnOutput(self, "ApiCredentialsSecretName", value=api_credentials.secret_name)
