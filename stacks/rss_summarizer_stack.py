@@ -16,6 +16,7 @@ from aws_cdk import (
     aws_lambda_event_sources as lambda_events,
     aws_iam as iam,
     aws_logs as logs,
+    aws_secretsmanager as sm,
 )
 from constructs import Construct
 
@@ -26,7 +27,6 @@ MIN_BODY_LENGTH = 300  # これ未満の記事は要約せずスキップ（Choi
 BEDROCK_MODEL_ID = os.getenv(
     "BEDROCK_MODEL_ID", "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
 )
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 FEED_URLS = ",".join([
     "https://aws.amazon.com/jp/blogs/news/feed/",
@@ -166,12 +166,25 @@ class RssSummarizerStack(Stack):
         )
 
         # --- notify: Slack通知 --------------------------------------------
+        # Secrets Manager に「箱」だけ作る。値はデプロイ後にCLIで登録する
+        # こうすることで、コードにもCloudFormationテンプレートにも値が残らない
+        slack_secret = sm.Secret(
+            self,
+            "SlackWebhookSecret",
+            secret_name="rss-summarizer/slack-webhook",
+            description="Slack Incoming Webhook URL",
+            removal_policy=RemovalPolicy.DESTROY,  # 学習用。本番はRETAIN
+        )
+
         notify_fn = make_lambda(
             "NotifyFunction",
             "notify",
             timeout_sec=30,
-            env={"SLACK_WEBHOOK_URL": SLACK_WEBHOOK_URL},
+            # ARN自体は機密ではないので環境変数で渡してよい
+            env={"SECRET_ARN": slack_secret.secret_arn},
         )
+        # Lambdaにシークレット読み取り権限を付与（このシークレットのみ）
+        slack_secret.grant_read(notify_fn)
 
         # ==================================================================
         # Phase 3: Step Functions（記事1件ごとの処理フロー）
@@ -324,3 +337,4 @@ class RssSummarizerStack(Stack):
         CfnOutput(self, "DlqUrl", value=dlq.queue_url)
         CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
         CfnOutput(self, "FetchFeedFunctionName", value=fetch_feed_fn.function_name)
+        CfnOutput(self, "SlackSecretName", value=slack_secret.secret_name)
